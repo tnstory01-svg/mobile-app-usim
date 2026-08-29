@@ -1,0 +1,13 @@
+# GJC runtime and session artifacts
+.gjc/
+
+# Gradle and Android local outputs
+.gradle/
+**/build/
+local.properties
+*.jks
+*.keystore
+
+# IDE
+.idea/
+*.iml
