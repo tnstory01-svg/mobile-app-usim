@@ -8,10 +8,15 @@ import android.content.IntentFilter
 import android.content.IntentSender
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.telephony.euicc.DownloadableSubscription
 import android.telephony.euicc.EuiccManager
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -22,78 +27,67 @@ import androidx.core.content.ContextCompat
 class ProbeActivity : AppCompatActivity() {
     private lateinit var activationCode: EditText
     private lateinit var outcomeView: TextView
+    private lateinit var stateStore: ProbeStateStore
     private var euiccManager: EuiccManager? = null
-
-    private var receiverRegistered = false
-    private var awaitingTerminalCallback = false
-    private var resolutionStarted = false
-    private var terminalCallbackReceived = false
-
-    private val callbackReceiver = object : BroadcastReceiver() {
+    private val timeoutHandler = Handler(Looper.getMainLooper())
+    private val timeoutRunnable = Runnable {
+        stateStore.expireTimedOut(System.currentTimeMillis())
+        renderPersistedOutcome()
+        scheduleTimeout()
+    }
+    private val stateChangedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            when (resultCode) {
-                EuiccManager.EMBEDDED_SUBSCRIPTION_RESULT_OK -> {
-                    publish(
-                        if (awaitingTerminalCallback) {
-                            ProbeOutcome.TerminalCallbackOk
-                        } else {
-                            ProbeOutcome.InitialCallbackOk
-                        },
-                    )
-                    awaitingTerminalCallback = false
-                    terminalCallbackReceived = true
-                }
-
-                EuiccManager.EMBEDDED_SUBSCRIPTION_RESULT_RESOLVABLE_ERROR -> {
-                    if (awaitingTerminalCallback || resolutionStarted) {
-                        publish(ProbeOutcome.TerminalCallbackResolvableError)
-                        awaitingTerminalCallback = false
-                        terminalCallbackReceived = true
-                    } else {
-                        publish(ProbeOutcome.InitialCallbackResolvableError)
-                        openResolution(intent)
-                    }
-                }
-
-                else -> {
-                    publish(
-                        if (awaitingTerminalCallback) {
-                            ProbeOutcome.TerminalCallbackError
-                        } else {
-                            ProbeOutcome.InitialCallbackError
-                        },
-                    )
-                    awaitingTerminalCallback = false
-                    terminalCallbackReceived = true
-                }
-            }
+            renderPersistedOutcome()
+            scheduleTimeout()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        stateStore = ProbeStateStore(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST_CODE)
+        }
         euiccManager = getSystemService(EuiccManager::class.java)
         setContentView(createContentView())
-        registerCallbackReceiver()
-        publish(ProbeOutcome.Ready)
+        renderPersistedOutcome()
+        handleResolutionIntent(intent)
     }
 
-    override fun onDestroy() {
-        if (receiverRegistered) {
-            unregisterReceiver(callbackReceiver)
-            receiverRegistered = false
-        }
-        super.onDestroy()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleResolutionIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ContextCompat.registerReceiver(
+            this,
+            stateChangedReceiver,
+            IntentFilter(ProbeCallbackReceiver.ACTION_STATE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        stateStore.expireTimedOut(System.currentTimeMillis())
+        renderPersistedOutcome()
+        scheduleTimeout()
+    }
+
+    override fun onPause() {
+        timeoutHandler.removeCallbacks(timeoutRunnable)
+        unregisterReceiver(stateChangedReceiver)
+        super.onPause()
     }
 
     @Deprecated("Resolution uses the framework activity-result contract.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == RESOLUTION_REQUEST_CODE) {
-            // This return does not determine download success; the callback receiver remains authoritative.
-            if (!terminalCallbackReceived) {
-                publish(ProbeOutcome.ResolutionCancelledOrUnknown)
-            }
+            stateStore.recordResolutionReturn()
+            renderPersistedOutcome()
+            scheduleTimeout()
         }
     }
 
@@ -111,12 +105,17 @@ class ProbeActivity : AppCompatActivity() {
                 hint = "Operator activation-code body"
                 isSaveEnabled = false
                 setFreezesText(false)
+                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
                 inputType = android.text.InputType.TYPE_CLASS_TEXT
+                imeOptions = EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
             }
-            addView(activationCode, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ))
+            addView(
+                activationCode,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
             addView(Button(context).apply {
                 text = "Submit to system"
                 setOnClickListener { dispatchDownload() }
@@ -129,79 +128,98 @@ class ProbeActivity : AppCompatActivity() {
     private fun dispatchDownload() {
         val body = activationCode.text.toString()
         activationCode.text.clear()
+        if (stateStore.hasActiveOperation()) {
+            publish(ProbeOutcome.SubmissionInProgress)
+            return
+        }
         if (body.isBlank()) {
-            publish(ProbeOutcome.LocalFailure(ProbeOutcome.Reason.EMPTY_ACTIVATION_CODE))
+            stateStore.recordLocalFailure(ProbeOutcome.Reason.EMPTY_ACTIVATION_CODE)
+            renderPersistedOutcome()
             return
         }
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY_EUICC)) {
-            publish(ProbeOutcome.LocalFailure(ProbeOutcome.Reason.ESIM_UNSUPPORTED))
+            stateStore.recordLocalFailure(ProbeOutcome.Reason.ESIM_UNSUPPORTED)
+            renderPersistedOutcome()
             return
         }
         val manager = euiccManager
         if (manager == null || !manager.isEnabled) {
-            publish(ProbeOutcome.LocalFailure(ProbeOutcome.Reason.ESIM_DISABLED))
+            stateStore.recordLocalFailure(ProbeOutcome.Reason.ESIM_DISABLED)
+            renderPersistedOutcome()
             return
         }
 
+        val operationId = stateStore.beginOperation(System.currentTimeMillis())
         try {
-            val subscription = DownloadableSubscription.forActivationCode(body)
-            resolutionStarted = false
-            awaitingTerminalCallback = false
-            terminalCallbackReceived = false
-            manager.downloadSubscription(subscription, false, callbackPendingIntent())
-            publish(ProbeOutcome.AppDispatch)
+            manager.downloadSubscription(
+                DownloadableSubscription.forActivationCode(body),
+                false,
+                callbackPendingIntent(operationId),
+            )
         } catch (_: SecurityException) {
-            publish(ProbeOutcome.LocalFailure(ProbeOutcome.Reason.REQUEST_REJECTED))
+            stateStore.failActiveOperation(ProbeOutcome.Reason.REQUEST_REJECTED)
         } catch (_: IllegalArgumentException) {
-            publish(ProbeOutcome.LocalFailure(ProbeOutcome.Reason.REQUEST_REJECTED))
+            stateStore.failActiveOperation(ProbeOutcome.Reason.REQUEST_REJECTED)
         }
+        renderPersistedOutcome()
+        scheduleTimeout()
     }
 
-    private fun openResolution(callbackIntent: Intent) {
-        resolutionStarted = true
-        awaitingTerminalCallback = true
+    private fun handleResolutionIntent(intent: Intent) {
+        if (intent.action != ProbeCallbackReceiver.ACTION_OPEN_RESOLUTION) return
+        val operationId = intent.getStringExtra(ProbeCallbackReceiver.EXTRA_OPERATION_ID) ?: return
+        @Suppress("DEPRECATION")
+        val callbackIntent = intent.getParcelableExtra<Intent>(
+            ProbeCallbackReceiver.EXTRA_CALLBACK_INTENT,
+        ) ?: return
+        if (!stateStore.beginResolution(operationId)) return
+
         try {
             val manager = euiccManager
             if (manager == null) {
-                awaitingTerminalCallback = false
-                publish(ProbeOutcome.LocalFailure(ProbeOutcome.Reason.RESOLUTION_UNAVAILABLE))
-                return
+                stateStore.failActiveOperation(ProbeOutcome.Reason.RESOLUTION_UNAVAILABLE)
+            } else {
+                manager.startResolutionActivity(
+                    this,
+                    RESOLUTION_REQUEST_CODE,
+                    callbackIntent,
+                    callbackPendingIntent(operationId),
+                )
+                stateStore.publishResolutionUi(operationId)
             }
-            manager.startResolutionActivity(
-                this,
-                RESOLUTION_REQUEST_CODE,
-                callbackIntent,
-                callbackPendingIntent(),
-            )
-            publish(ProbeOutcome.ResolutionUi)
         } catch (_: IllegalArgumentException) {
-            awaitingTerminalCallback = false
-            publish(ProbeOutcome.LocalFailure(ProbeOutcome.Reason.RESOLUTION_UNAVAILABLE))
+            stateStore.failActiveOperation(ProbeOutcome.Reason.RESOLUTION_UNAVAILABLE)
         } catch (_: IntentSender.SendIntentException) {
-            awaitingTerminalCallback = false
-            publish(ProbeOutcome.LocalFailure(ProbeOutcome.Reason.RESOLUTION_UNAVAILABLE))
+            stateStore.failActiveOperation(ProbeOutcome.Reason.RESOLUTION_UNAVAILABLE)
+        }
+        renderPersistedOutcome()
+        scheduleTimeout()
+    }
+
+    private fun callbackPendingIntent(operationId: String): PendingIntent {
+        val callback = Intent(this, ProbeCallbackReceiver::class.java)
+            .setAction(ProbeCallbackReceiver.ACTION_DOWNLOAD_CALLBACK)
+            .setData(ProbeCallbackReceiver.callbackUri(operationId))
+            .putExtra(ProbeCallbackReceiver.EXTRA_OPERATION_ID, operationId)
+        return PendingIntent.getBroadcast(
+            this,
+            operationId.hashCode(),
+            callback,
+            PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_MUTABLE,
+        )
+    }
+
+    private fun renderPersistedOutcome() {
+        if (::outcomeView.isInitialized) {
+            outcomeView.text = stateStore.outcomeSequence().joinToString("\n") { it.message }
         }
     }
 
-    private fun callbackPendingIntent(): PendingIntent {
-        val callback = Intent(ACTION_DOWNLOAD_CALLBACK).setPackage(packageName)
-        return PendingIntent.getBroadcast(
-            this,
-            CALLBACK_REQUEST_CODE,
-            callback,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-        )
-    }
-
-    private fun registerCallbackReceiver() {
-        val filter = IntentFilter(ACTION_DOWNLOAD_CALLBACK)
-        ContextCompat.registerReceiver(
-            this,
-            callbackReceiver,
-            filter,
-            ContextCompat.RECEIVER_NOT_EXPORTED,
-        )
-        receiverRegistered = true
+    private fun scheduleTimeout() {
+        timeoutHandler.removeCallbacks(timeoutRunnable)
+        stateStore.timeoutDelayMillis(System.currentTimeMillis())?.let { delay ->
+            timeoutHandler.postDelayed(timeoutRunnable, delay)
+        }
     }
 
     private fun publish(outcome: ProbeOutcome) {
@@ -209,8 +227,7 @@ class ProbeActivity : AppCompatActivity() {
     }
 
     private companion object {
-        const val ACTION_DOWNLOAD_CALLBACK = "com.tnstory.esimprobe.DOWNLOAD_CALLBACK"
-        const val CALLBACK_REQUEST_CODE = 100
         const val RESOLUTION_REQUEST_CODE = 101
+        const val NOTIFICATION_PERMISSION_REQUEST_CODE = 102
     }
 }

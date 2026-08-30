@@ -12,6 +12,14 @@ sealed interface ProbeOutcome {
         override val message = "Activation request sent to the system."
     }
 
+    data object SubmissionInProgress : ProbeOutcome {
+        override val message = "An activation request is already awaiting the system."
+    }
+
+    data object InconclusiveNoCallback : ProbeOutcome {
+        override val message = "No system callback arrived within five minutes."
+    }
+
     data object InitialCallbackOk : ProbeOutcome {
         override val message = "Initial system callback reported success."
     }
@@ -54,5 +62,6 @@ sealed interface ProbeOutcome {
         ESIM_DISABLED("eSIM management is not enabled on this device."),
         REQUEST_REJECTED("The system did not accept the activation request."),
         RESOLUTION_UNAVAILABLE("The system could not open its resolution UI."),
+        RESOLUTION_NOTIFICATION_UNAVAILABLE("The app could not notify you to continue the system resolution."),
     }
 }
